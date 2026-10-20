@@ -26,11 +26,13 @@ createServer(async (req, res) => {
     return;
   }
   try {
+    // Read first: writeHead antes do await faria o catch reescrever headers e derrubar o servidor.
+    const body = await readFile(file);
     res
       .writeHead(200, {
         "Content-Type": TYPES[extname(file)] ?? "application/octet-stream",
       })
-      .end(await readFile(file));
+      .end(body);
   } catch {
     res.writeHead(404).end("Not found");
   }

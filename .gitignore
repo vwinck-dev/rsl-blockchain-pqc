@@ -4,3 +4,5 @@ src/
 node_modules/
 .remember/
 dist/
+.env
+tools/*.json

@@ -140,6 +140,15 @@ button.primary:disabled {
 .controls input[type="search"] {
   flex: 1 1 10rem;
 }
+.controls label.check {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
 #count {
   margin-bottom: 0.5rem;
 }

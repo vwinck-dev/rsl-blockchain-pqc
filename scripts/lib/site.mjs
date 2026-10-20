@@ -2,7 +2,14 @@ import { cpSync, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join, relative } from "node:path";
 
 const SITE_ENTRIES = ["index.html", "assets", "data"];
-const STUDY_MARKER = '"criterion_id"';
+// Nomes de campo que só existem em dados de estudo em texto puro, nunca no código do
+// site (o bundle ofuscado não mantém identificadores legíveis). "criterion_id" é o
+// schema original; os demais são os campos desta fork.
+const STUDY_MARKERS = [
+  '"criterion_id"',
+  '"criterio_parsifal"',
+  '"motivo_parsifal"',
+];
 
 function* walk(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -18,7 +25,9 @@ export function findPlaintext(dir) {
   for (const file of walk(dir)) {
     const leaks =
       file.endsWith(".json") ||
-      readFileSync(file, "latin1").includes(STUDY_MARKER);
+      STUDY_MARKERS.some((marker) =>
+        readFileSync(file, "latin1").includes(marker),
+      );
     if (leaks) offenders.push(relative(dir, file));
   }
   return offenders;

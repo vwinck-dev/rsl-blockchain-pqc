@@ -37,6 +37,15 @@ test("findPlaintext: flags study fields hidden in other files", () => {
   assert.equal(findPlaintext(root).length, 1);
 });
 
+test("findPlaintext: flags fields of this fork's schema", () => {
+  const root = fixture();
+  writeFileSync(
+    join(root, "assets", "leak.txt"),
+    '{"criterio_parsifal": {"id": 1}, "motivo_parsifal": "x"}',
+  );
+  assert.equal(findPlaintext(root).length, 1);
+});
+
 test("packageSite: copies the site into dist", () => {
   const root = fixture();
   packageSite(root, join(root, "dist"));
