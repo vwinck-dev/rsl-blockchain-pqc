@@ -16,10 +16,33 @@ code is in English.
 | `index.html`, `assets/`            | The page, styles and the obfuscated bundle                                 |
 | `data/studies.enc`                 | Encrypted data (versioned)                                                 |
 | `scripts/`                         | Encryption, build, dev server, test runner                                 |
+| `tools/`                           | Parsifal extraction and LLM audit (see below); outputs are gitignored      |
 | `test/`                            | Tests (`node:test`)                                                        |
 | `.githooks/`                       | `pre-commit` (blocks sensitive files, runs tests) and `pre-push`           |
 | `Dockerfile`, `docker-compose.yml` | One environment for dev, tests and CI                                      |
 | `src/`, `raw/`, `deliverables/`    | Original source, plaintext data, PDFs/DOCX. Never committed (`.gitignore`) |
+
+## Audit pipeline
+
+`tools/` reads the review's accepted articles from Parsifal, has an LLM re-judge each
+abstract against the protocol criteria, and writes `raw/approved.json` + `raw/rejected.json`.
+It only issues GETs to Parsifal: nothing is ever modified there, and the triage changes stay
+manual. Secrets live in `.env` (gitignored): `PARSIFAL_SESSION`, `GROQ_API_KEY`,
+`GEMINI_API_KEY`, `DATA_PASSWORD`.
+
+```bash
+npm run extrair   # GET accepted articles -> tools/artigos.json
+npm run avaliar   # LLM audit -> tools/cache.json + raw/approved.json + raw/rejected.json
+LIMIT=5 npm run avaliar   # smoke test: only the next 5
+```
+
+The audit uses Groq first (1000 req/min, high quota) and falls back to Gemini models when a
+provider runs out of quota. Results are cached per article, so re-running only evaluates what
+is new, and the site's "Reprovados" tab plus the "Só divergentes" filter list exactly the
+articles that are `Accepted` in Parsifal but rejected by the audit — the manual review queue.
+
+The Parsifal session cookie expires every few weeks; when it does, copy a fresh `sessionid`
+from your browser's devtools (Network → parsif.al → Cookies) into `.env`.
 
 ## Development
 

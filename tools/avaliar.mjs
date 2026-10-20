@@ -1,6 +1,7 @@
-// Audita os artigos extraidos com o Gemini e gera raw/approved.json + raw/rejected.json
-// para o site. Le tools/artigos.json e criterios.txt; cacheia por titulo+abstract em
-// tools/cache.json (reavaliar nao gasta cota). Nao toca no Parsifal.
+// Audita os artigos com um LLM (Groq como provedor principal, Gemini como reserva) e
+// gera raw/approved.json + raw/rejected.json para o site. Le tools/artigos.json e
+// criterios.txt; cacheia por titulo+abstract em tools/cache.json (reavaliar nao gasta
+// cota). Nao toca no Parsifal.
 //
 // Uso: node tools/avaliar.mjs            (tudo que falta)
 //      LIMIT=5 node tools/avaliar.mjs    (fumaça: so os proximos 5)
@@ -11,8 +12,10 @@ const CACHE = new URL("./cache.json", import.meta.url);
 const INPUT = new URL("./artigos.json", import.meta.url);
 const CRITERIOS = new URL("../../criterios.txt", import.meta.url);
 const OUT_DIR = new URL("../raw/", import.meta.url);
+// Groq responde em ~1s e tem cota de 1000 req (vs 20/dia do Gemini free), entao 3s
+// de intervalo basta; o gap cresce sozinho se algum provedor reclamar de cota.
 const BATCH = 3;
-const GAP_MS = 8000; // free tier cobra por minuto; o gap se ajusta sozinho (ver 429 abaixo)
+const GAP_MS = 3000;
 const GAP_MAX_MS = 120_000;
 
 try {
@@ -20,10 +23,36 @@ try {
 } catch {
   // variaveis podem vir do ambiente.
 }
-const KEY = process.env.GEMINI_API_KEY;
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
-if (!KEY) {
-  console.error("Falta GEMINI_API_KEY no .env.");
+
+const GROQ_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODELS = (
+  process.env.GROQ_MODELS ||
+  ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"].join(",")
+)
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
+
+const GEMINI_KEY = process.env.GEMINI_API_KEY;
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
+// A cota do tier gratuito do Gemini e POR MODELO (ex.: 20 req/dia no 3.8-flash).
+const MODEL_FALLBACKS = (
+  process.env.GEMINI_MODELS ||
+  [
+    MODEL,
+    "gemini-3.1-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3-flash-preview",
+  ].join(",")
+)
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
+
+if (!GROQ_KEY && !GEMINI_KEY) {
+  console.error("Falta GROQ_API_KEY (ou GEMINI_API_KEY) no .env.");
   process.exit(1);
 }
 
@@ -85,9 +114,38 @@ const userPrompt = (artigo) =>
     `Abstract: ${artigo.abstract || "(sem abstract)"}`,
   ].join("\n");
 
+// Groq: API compativel com OpenAI. mode: "json_object" forca JSON valido.
+async function callGroq(text, model) {
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${GROQ_KEY}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: text },
+      ],
+    }),
+    signal: AbortSignal.timeout(120_000),
+  });
+  const body = await res.text();
+  let content = null;
+  try {
+    content = JSON.parse(body).choices?.[0]?.message?.content ?? null;
+  } catch {
+    // corpo nao-JSON (erro do provedor): parseBatch trata como resposta invalida.
+  }
+  return { res, body, content };
+}
+
 async function callGemini(text, model) {
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${KEY}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -102,7 +160,15 @@ async function callGemini(text, model) {
       signal: AbortSignal.timeout(120_000),
     },
   );
-  return { res, body: await res.text() };
+  const body = await res.text();
+  let content = null;
+  try {
+    content =
+      JSON.parse(body).candidates?.[0]?.content?.parts?.[0]?.text ?? null;
+  } catch {
+    // idem: erro do provedor.
+  }
+  return { res, body, content };
 }
 
 function parseBatch(text, expected) {
@@ -144,32 +210,56 @@ console.log(
 
 const limit = Number(process.env.LIMIT || 0);
 const fila = limit ? pendentes.slice(0, limit) : pendentes;
-let model = MODEL;
 let avaliados = 0;
 let gapMs = GAP_MS;
+
+// Ordem de preferencia: Groq (cota alta, rapido) e depois Gemini como reserva.
+// Provedores ja esgotados nesta rodada ficam fora ate o reset.
+const provedoresDeNovo = () => [
+  ...(GROQ_KEY ? GROQ_MODELS.map((m) => `groq:${m}`) : []),
+  ...(GEMINI_KEY ? MODEL_FALLBACKS : []),
+];
+const esgotados = new Set();
+const filaProvedores = provedoresDeNovo();
+console.log(`provedores: ${filaProvedores.join(", ")} (lote de ${BATCH})`);
 
 for (let i = 0; i < fila.length; i += BATCH) {
   const lote = fila.slice(i, i + BATCH);
   const texto = lote.map(userPrompt).join("\n\n---\n\n");
   let resultado = null;
 
-  for (let tentativa = 0; tentativa < 4 && !resultado; tentativa++) {
-    const { res, body } = await callGemini(texto, model);
-    if (res.status === 404 && model !== "gemini-2.5-flash") {
-      console.warn(
-        `  modelo ${model} indisponível — tentando gemini-2.5-flash`,
-      );
-      model = "gemini-2.5-flash";
-      continue;
-    }
-    if (res.status === 429) {
-      // Backoff adaptativo: free tier cobra por minuto/token. Ao esbarrar, dobra o
-      // intervalo entre lotes (ate GAP_MAX_MS) e espera antes de tentar de novo.
-      gapMs = Math.min(gapMs * 2, GAP_MAX_MS);
-      console.log(
-        `  429 (cota) — gap vira ${(gapMs / 1000).toFixed(0)}s, aguardando antes de retry (${tentativa + 1}/4)`,
-      );
-      await sleep(gapMs);
+  // Cadeia de provedores: Groq primeiro (cota e velocidade), depois os modelos Gemini.
+  // "esgotado" vale para o par provedor+modelo; 404 descarta o modelo da lista.
+  for (
+    let tentativa = 0;
+    tentativa < filaProvedores.length + 2 && !resultado;
+    tentativa++
+  ) {
+    const atual = filaProvedores[0];
+    const chamada = atual.startsWith("groq:")
+      ? callGroq(texto, atual.slice(5))
+      : callGemini(texto, atual);
+    const { res, body, content } = await chamada;
+
+    const proximo = () => {
+      esgotados.add(atual);
+      filaProvedores.shift();
+      if (!filaProvedores.length) {
+        gapMs = Math.min(gapMs * 2, GAP_MAX_MS);
+        console.log(
+          `  todos os provedores esgotados — aguardando ${(gapMs / 1000).toFixed(0)}s`,
+        );
+        esgotados.clear();
+        filaProvedores.push(...provedoresDeNovo());
+        return sleep(gapMs);
+      }
+      console.log(`  sobrecarregado — trocando para ${filaProvedores[0]}`);
+      return Promise.resolve();
+    };
+
+    if (res.status === 429 || res.status === 404) {
+      // 429: cota esgotada. 404: modelo inexistente/sem acesso.
+      await proximo();
       continue;
     }
     if (!res.ok) {
@@ -177,24 +267,21 @@ for (let i = 0; i < fila.length; i += BATCH) {
         await sleep(5000);
         continue;
       }
-      throw new Error(`HTTP ${res.status}: ${body.slice(0, 500)}`);
+      throw new Error(`HTTP ${res.status} (${atual}): ${body.slice(0, 500)}`);
     }
     try {
-      const raw = JSON.parse(body);
-      resultado = parseBatch(
-        raw.candidates?.[0]?.content?.parts?.[0]?.text ?? "",
-        lote.length,
-      );
+      resultado = parseBatch(content ?? "", lote.length);
     } catch (err) {
-      if (tentativa >= 3) throw new Error(`resposta inválida: ${err.message}`);
-      await sleep(3000);
+      if (tentativa >= filaProvedores.length + 1)
+        throw new Error(`resposta inválida: ${err.message}`);
+      console.log(`  resposta inválida de ${atual} — tentando o próximo`);
+      await proximo();
     }
   }
 
   if (!resultado) {
-    // Esgotou os retries: deixa os artigos pendentes (cache retoma depois) e esfria,
-    // senão a proxima leva 429 na sequencia.
-    console.log(`  lote ${i / BATCH + 1} pulado por cota — esfriando 90s`);
+    // Esgotou as tentativas: deixa os artigos pendentes (o cache retoma depois) e esfria.
+    console.log(`  lote ${i / BATCH + 1} pulado — esfriando 90s`);
     await sleep(90_000);
     continue;
   }
@@ -230,7 +317,7 @@ for (let i = 0; i < fila.length; i += BATCH) {
   gapMs = Math.max(GAP_MS, Math.round(gapMs * 0.85));
   await sleep(gapMs);
   console.log(
-    `[${Math.min(i + BATCH, fila.length)}/${fila.length}] lote ok (${avaliados} avaliados, gap ${(gapMs / 1000).toFixed(0)}s, modelo ${model})`,
+    `[${Math.min(i + BATCH, fila.length)}/${fila.length}] lote ok (${avaliados} avaliados, gap ${(gapMs / 1000).toFixed(0)}s, provedor ${filaProvedores[0]})`,
   );
 }
 

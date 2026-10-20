@@ -44,6 +44,8 @@ const decode = (text) =>
     .replace(/&nbsp;/g, " ")
     .replace(/&amp;/g, "&");
 const stripTags = (html) => decode(String(html).replace(/<[^>]*>/g, ""));
+// O Parsifal grava a string "None" quando o campo esta vazio.
+const vazio = (value) => (value === "None" ? "" : value);
 
 // Guarda de leitura: so existem GETs daqui, sempre para o parsif.al.
 async function get(path, { xhr = false, retries = 2 } = {}) {
@@ -94,14 +96,19 @@ function parseRows(html) {
 function input(html, name) {
   const tag =
     html.match(new RegExp(`<input[^>]*name="${name}"[^>]*>`))?.[0] ?? "";
-  return decode(tag.match(/value="([^"]*)"/)?.[1] ?? "");
+  const value = vazio(decode(tag.match(/value="([^"]*)"/)?.[1] ?? ""));
+  // DOI costuma vir sem esquema ("10.1109/..."); sem isso o link vira caminho
+  // relativo no site. URL ja chega completa.
+  return name === "doi" && value && !/^https?:\/\//i.test(value)
+    ? `https://doi.org/${value}`
+    : value;
 }
 
 function textarea(html, name) {
   const m = html.match(
     new RegExp(`<textarea[^>]*name="${name}"[^>]*>([\\s\\S]*?)</textarea>`),
   );
-  return m ? decode(m[1]) : "";
+  return m ? vazio(decode(m[1])) : "";
 }
 
 function select(html, name) {
